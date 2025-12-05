@@ -1,0 +1,311 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Rodent BMI Lab Assistant</title>
+    
+    <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.1/dist/chart.umd.min.js"></script>
+    
+    <style>
+        body { font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif; background-color: #eef1f5; margin: 0; padding: 0; }
+        .dashboard-grid { display: grid; grid-template-columns: 1fr 1fr 1.5fr; gap: 20px; max-width: 1200px; margin: 20px auto; }
+        .panel { background: white; padding: 25px; border-radius: 12px; box-shadow: 0 4px 12px rgba(0,0,0,0.08); }
+        h2 { border-bottom: 2px solid #3366ff; padding-bottom: 10px; margin-top: 0; color: #333; }
+
+        /* Left Zone Styles */
+        #live-data h2 { color: #007bff; border-color: #007bff; }
+        .metric { margin-bottom: 25px; }
+        .metric-label { font-size: 1.1em; color: #555; }
+        .data-display { font-size: 3.5em; font-weight: 700; color: #333; margin-top: 5px; }
+        #categoryDisplay { font-size: 1.8em; padding: 8px; border-radius: 6px; display: inline-block; margin-top: 10px; }
+        
+        /* Middle Zone Styles */
+        #controls h2 { color: #28a745; border-color: #28a745; }
+        input, select { width: 100%; padding: 10px; margin-bottom: 15px; border: 1px solid #ddd; border-radius: 5px; box-sizing: border-box; }
+        button { padding: 12px 20px; font-size: 1em; border: none; border-radius: 5px; cursor: pointer; transition: background-color 0.3s; width: 100%; margin-top: 10px; }
+        #connectButton { background-color: #007bff; color: white; }
+        #connectButton:hover { background-color: #0056b3; }
+        #saveButton { background-color: #28a745; color: white; }
+        #saveButton:hover:not(:disabled) { background-color: #1e7e34; }
+        #saveButton:disabled { background-color: #ccc; cursor: not-allowed; }
+
+        /* Right Zone Styles */
+        #analysis h2 { color: #dc3545; border-color: #dc3545; }
+        #historicalChart { height: 300px; }
+
+        /* Status and Alerts */
+        .status { padding: 10px; border-radius: 4px; margin-bottom: 15px; text-align: center; }
+        .status.connected { background-color: #d4edda; color: #155724; }
+        .status.disconnected { background-color: #f8d7da; color: #721c24; }
+        .alert-box { border: 2px solid #ffc107; background-color: #fff3cd; color: #856404; padding: 15px; border-radius: 8px; margin-top: 20px; font-weight: bold; display: none; }
+    </style>
+</head>
+<body>
+
+    <div class="dashboard-grid">
+
+        <div id="live-data" class="panel">
+            <h2>🔴 Live Weight</h2>
+            <div id="statusMessage" class="status disconnected">Disconnected</div>
+
+            <div class="metric">
+                <div class="metric-label">Current Weight (g)</div>
+                <div id="weightDisplay" class="data-display">--</div>
+            </div>
+
+            <div class="metric">
+                <div class="metric-label">Calculated Lee Index</div>
+                <div id="bmiDisplay" class="data-display">--</div>
+            </div>
+
+            <div class="metric">
+                <div class="metric-label">Category</div>
+                <div id="categoryDisplay">---</div>
+            </div>
+            
+            <div id="alertBox" class="alert-box">
+                ⚠️ **ALERT:** Significant weight change detected!
+            </div>
+        </div>
+
+        <div id="controls" class="panel">
+            <h2>⚙️ Measurement Controls</h2>
+            
+            <button id="connectButton" onclick="connectSerial()">Connect Arduino</button>
+            <hr>
+
+            <label for="rodentID">Rodent ID / Tag:</label>
+            <input type="text" id="rodentID" placeholder="e.g., M-001 or Diet Group A">
+
+            <label for="lengthInput">Length (cm):</label>
+            <input type="number" id="lengthInput" value="10.0" min="1" step="0.1" required>
+
+            <label for="species">Species/Strain:</label>
+            <select id="species">
+                <option value="mouse">Mouse</option>
+                <option value="rat">Rat</option>
+                <option value="other">Other</option>
+            </select>
+            
+            <button id="saveButton" disabled onclick="saveMeasurement()">💾 Record & Save Data</button>
+            
+            <hr>
+            <h2>📝 Lab Utility</h2>
+            <button onclick="downloadCSV()">Export All Data (CSV)</button>
+            <button onclick="alert('PDF Generation Not Implemented Yet.')">Generate PDF Report</button>
+        </div>
+
+        <div id="analysis" class="panel">
+            <h2>📈 Data Analysis</h2>
+            
+            <canvas id="historicalChart"></canvas>
+            
+            <div id="summary">
+                <p>Total Measurements Stored: <span id="measurementCount">0</span></p>
+            </div>
+        </div>
+    </div>
+
+    <script>
+        // --- DOM Elements ---
+        const connectButton = document.getElementById('connectButton');
+        const statusMessage = document.getElementById('statusMessage');
+        const weightDisplay = document.getElementById('weightDisplay');
+        const bmiDisplay = document.getElementById('bmiDisplay');
+        const categoryDisplay = document.getElementById('categoryDisplay');
+        const lengthInput = document.getElementById('lengthInput');
+        const rodentID = document.getElementById('rodentID');
+        const saveButton = document.getElementById('saveButton');
+        const alertBox = document.getElementById('alertBox');
+        const measurementCount = document.getElementById('measurementCount');
+        
+        let port; 
+        const history = []; // Local storage array for measurements
+        let lastWeight = 0;
+
+        // --- CHART SETUP ---
+        const ctx = document.getElementById('historicalChart').getContext('2d');
+        const historicalChart = new Chart(ctx, {
+            type: 'line',
+            data: {
+                labels: [], // Time or Measurement ID
+                datasets: [{
+                    label: 'Lee Index BMI Trend',
+                    data: [],
+                    borderColor: '#007bff',
+                    backgroundColor: 'rgba(0, 123, 255, 0.1)',
+                    tension: 0.2
+                }]
+            },
+            options: { responsive: true, maintainAspectRatio: false }
+        });
+
+        // --- CORE FUNCTION 1: CONNECT SERIAL (as previously discussed) ---
+        async function connectSerial() {
+            // Check browser compatibility
+            if (!('serial' in navigator)) {
+                statusMessage.textContent = 'Error: Use Chrome or Edge.';
+                return;
+            }
+
+            try {
+                port = await navigator.serial.requestPort();
+                await port.open({ baudRate: 9600 });
+                statusMessage.textContent = '✅ Connected';
+                statusMessage.className = 'status connected';
+                connectButton.textContent = 'Disconnect';
+                connectButton.onclick = disconnectSerial;
+                readSerial();
+            } catch (error) {
+                statusMessage.textContent = `Error: ${error.message}`;
+                statusMessage.className = 'status disconnected';
+            }
+        }
+
+        // --- CORE FUNCTION 2: READ DATA STREAM (as previously discussed) ---
+        async function readSerial() {
+            const textDecoder = new TextDecoderStream();
+            port.readable.pipeTo(textDecoder.writable);
+            const reader = textDecoder.readable.getReader();
+
+            while (true) {
+                const { value, done } = await reader.read();
+                if (done) { reader.releaseLock(); break; }
+                if (value) { processData(value); }
+            }
+        }
+
+        // --- CORE FUNCTION 3: PROCESS AND CALCULATE ---
+        function processData(serialData) {
+            // Expected Format: "WEIGHT:24.50"
+            const match = serialData.match(/WEIGHT:([0-9.]+)/);
+            if (match) {
+                const weight = parseFloat(match[1]); 
+                const length = parseFloat(lengthInput.value); 
+                
+                // 1. Display Weight
+                weightDisplay.textContent = `${weight.toFixed(2)}`;
+                saveButton.disabled = false;
+
+                // 2. Alert Logic (Simple check for large drop/gain)
+                if (lastWeight > 0 && Math.abs(weight - lastWeight) / lastWeight > 0.3) { // >30% change
+                    alertBox.style.display = 'block';
+                } else {
+                    alertBox.style.display = 'none';
+                }
+                lastWeight = weight; // Update last known weight
+
+                // 3. Calculate BMI (Lee Index)
+                if (length > 0) {
+                    // Lee Index: (Cubic Root of Weight in grams / Naso-Anal Length in cm) * 10000
+                    const leeIndex = (Math.cbrt(weight) / length) * 10000;
+                    bmiDisplay.textContent = leeIndex.toFixed(2);
+                    setCategory(leeIndex); 
+                } else {
+                    bmiDisplay.textContent = 'Enter Length';
+                    categoryDisplay.textContent = '---';
+                }
+            }
+        }
+
+        // --- CORE FUNCTION 4: CATEGORIZATION ---
+        function setCategory(bmi) {
+            let categoryText = '';
+            let color = '';
+
+            // **NOTE: ADJUST THESE RANGES FOR YOUR SPECIFIC RODENT MODEL!**
+            if (bmi < 240) {
+                categoryText = "Underweight 🚨"; // LED 1
+                color = '#ffc107'; // Orange
+            } else if (bmi >= 240 && bmi <= 310) {
+                categoryText = "Normal ✅"; // LED 2
+                color = '#28a745'; // Green
+            } else if (bmi > 310 && bmi <= 360) {
+                categoryText = "Overweight 🟡"; // LED 3
+                color = '#ff9800'; // Amber
+            } else {
+                categoryText = "Obese ❌"; // LED 4
+                color = '#dc3545'; // Red
+            }
+            categoryDisplay.textContent = categoryText;
+            categoryDisplay.style.backgroundColor = color;
+            categoryDisplay.style.color = 'white';
+        }
+
+
+        // --- CORE FUNCTION 5: RECORD & SAVE MEASUREMENT ---
+        function saveMeasurement() {
+            if (!rodentID.value) {
+                alert("Please enter a Rodent ID before saving!");
+                return;
+            }
+
+            const now = new Date();
+            const measurement = {
+                id: rodentID.value,
+                timestamp: now.toLocaleString(),
+                date: now.toISOString().split('T')[0],
+                length_cm: parseFloat(lengthInput.value),
+                weight_g: parseFloat(weightDisplay.textContent),
+                lee_index: parseFloat(bmiDisplay.textContent),
+                category: categoryDisplay.textContent.split(' ')[0]
+            };
+            
+            // 1. Store Locally (for charts)
+            history.push(measurement);
+            updateChart(measurement.lee_index, measurement.id);
+            measurementCount.textContent = history.length;
+            
+            // 2. **CLOUD INTEGRATION (TO DO)**
+            // This is where you would use the JavaScript Fetch API to send 'measurement'
+            // to a Google Apps Script URL (for Google Sheets) or a Firebase endpoint.
+            console.log("Measurement Saved (Locally). Ready to send to cloud:", measurement);
+
+            // Give visual feedback and reset save button
+            saveButton.textContent = '✅ Saved!';
+            setTimeout(() => { 
+                saveButton.textContent = '💾 Record & Save Data';
+                saveButton.disabled = true;
+            }, 2000);
+        }
+
+        // --- CORE FUNCTION 6: CHART UPDATES ---
+        function updateChart(leeIndex, label) {
+            // Add new data point to the chart
+            historicalChart.data.labels.push(label);
+            historicalChart.data.datasets[0].data.push(leeIndex);
+            historicalChart.update();
+        }
+
+        // --- CORE FUNCTION 7: CSV EXPORT ---
+        function downloadCSV() {
+            if (history.length === 0) {
+                alert("No data recorded yet!");
+                return;
+            }
+            const header = Object.keys(history[0]).join(',');
+            const csv = history.map(row => Object.values(row).join(',')).join('\n');
+            const csvContent = `${header}\n${csv}`;
+            
+            const blob = new Blob([csvContent], { type: 'text/csv;charset=utf-8;' });
+            const url = URL.createObjectURL(blob);
+            const link = document.createElement("a");
+            link.setAttribute("href", url);
+            link.setAttribute("download", `Rodent_Data_Export_${new Date().toISOString().split('T')[0]}.csv`);
+            link.click();
+        }
+
+        // --- UTILITY: Disconnect (as previously discussed) ---
+        async function disconnectSerial() {
+            if (port) {
+                await port.close();
+                statusMessage.textContent = 'Disconnected';
+                statusMessage.className = 'status disconnected';
+                connectButton.textContent = 'Connect Arduino';
+                connectButton.onclick = connectSerial;
+            }
+        }
+    </script>
+</body>
+</html>
